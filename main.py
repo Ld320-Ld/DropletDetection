@@ -346,7 +346,7 @@ def train_model():
             name="exp4",
             save=True,
             save_period=10,
-            cache=False,  # 禁用缓存以减少内存使用
+            cache=False,  
             amp=True,
             workers=0, 
             exist_ok=True,
