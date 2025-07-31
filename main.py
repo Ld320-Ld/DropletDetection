@@ -389,7 +389,7 @@ def train_model():
                 
                 # 确保模型在正确的设备上
                 if device != "cpu":
-                    model.model = model.model.to(device)
+                    model.model = model.model.to(f"cuda:{device}")
                     
             else:
                 print("警告：检测头结构不符合预期，无法添加CBAM模块")
@@ -628,11 +628,11 @@ def test_model():
 
 def main():
     """主函数"""
-    # if not check_dataset_ready():
-    #     print("\n数据集未准备，开始处理...")
-    #     prepare_dataset()
-    # else:
-    #     print("\n检测到已存在的数据集，跳过处理步骤...")
+    if not check_dataset_ready():
+        print("\n数据集未准备，开始处理...")
+        prepare_dataset()
+    else:
+        print("\n检测到已存在的数据集，跳过处理步骤...")
 
     if not os.path.exists("dataset.yaml"):
         print("\n创建数据集配置文件...")
