@@ -11,6 +11,7 @@ import traceback
 from ultralytics import YOLO
 from tqdm import tqdm
 import gc
+import psutil  # 用于系统资源监控
 
 
 
@@ -133,6 +134,22 @@ def clean_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def monitor_resources():
+    """监控系统资源使用情况"""
+    try:
+        if torch.cuda.is_available():
+            gpu_memory_used = torch.cuda.memory_allocated() / 1024**3
+            gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            gpu_memory_cached = torch.cuda.memory_reserved() / 1024**3
+            print(f"GPU内存 - 已使用: {gpu_memory_used:.1f}GB / 总计: {gpu_memory_total:.1f}GB / 缓存: {gpu_memory_cached:.1f}GB")
+        
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        print(f"CPU使用率: {cpu_percent:.1f}% | 系统内存使用: {memory.percent:.1f}%")
+    except Exception as e:
+        print(f"资源监控出错: {e}")
 
 
 def process_single_image(args):
@@ -321,39 +338,70 @@ def train_model():
             print("本地未找到模型文件，将从官方下载...")
             model = YOLO("yolov8m.pt")
 
-        # 修改这部分代码
-        from models.edge_attention import CBAM
-        
-        # 获取检测头
-        detect_layer = model.model.model[-1]
-        
-        # 检查模型结构
-        print("\n当前模型结构:")
-        print(model.model)
-        
+        # 安全地添加CBAM模块
         try:
-            # 遍历所有检测头分支并添加CBAM
-            for i in range(len(detect_layer.cv2)):
-                # 获取输入通道数
-                in_channels = detect_layer.cv2[i][0].conv.in_channels
-                # 获取输出通道数
-                out_channels = detect_layer.cv2[i][-1].out_channels
-                
-                # 构建新的序列
-                new_seq = nn.Sequential(
-                    CBAM(in_channels=in_channels),
-                    detect_layer.cv2[i][0],  # 保留原有的Conv层
-                    detect_layer.cv2[i][1],  # 保留原有的Conv层
-                    detect_layer.cv2[i][2]   # 保留原有的Conv2d层
-                )
-                detect_layer.cv2[i] = new_seq
-
-            print("\nCBAM模块添加成功!")
+            from models.edge_attention import CBAM
             
-        except Exception as e:
-            print(f"\n修改模型结构时出错: {str(e)}")
-            print("检测头结构：", detect_layer)
-            return
+            # 获取检测头
+            detect_layer = model.model.model[-1]
+            
+            print("\n正在添加CBAM模块到检测头...")
+            
+            # 检查检测头结构是否符合预期
+            if hasattr(detect_layer, 'cv2') and isinstance(detect_layer.cv2, (list, nn.ModuleList)):
+                print(f"检测到 {len(detect_layer.cv2)} 个检测头分支")
+                
+                # 安全地遍历所有检测头分支并添加CBAM
+                for i in range(len(detect_layer.cv2)):
+                    try:
+                        # 检查当前分支的结构
+                        current_branch = detect_layer.cv2[i]
+                        if isinstance(current_branch, nn.Sequential) and len(current_branch) >= 3:
+                            # 获取第一个卷积层的输入通道数
+                            first_conv = current_branch[0]
+                            if hasattr(first_conv, 'conv'):
+                                in_channels = first_conv.conv.in_channels
+                            elif hasattr(first_conv, 'in_channels'):
+                                in_channels = first_conv.in_channels
+                            else:
+                                print(f"警告：无法确定第 {i} 个分支的输入通道数，跳过")
+                                continue
+                            
+                            # 创建CBAM模块
+                            cbam_module = CBAM(in_channels=in_channels)
+                            
+                            # 构建新的序列，将CBAM插入到开头
+                            new_layers = [cbam_module] + list(current_branch)
+                            new_seq = nn.Sequential(*new_layers)
+                            
+                            # 替换原有分支
+                            detect_layer.cv2[i] = new_seq
+                            print(f"成功为第 {i} 个分支添加CBAM (输入通道: {in_channels})")
+                            
+                        else:
+                            print(f"警告：第 {i} 个分支结构不符合预期，跳过CBAM添加")
+                            
+                    except Exception as branch_e:
+                        print(f"为第 {i} 个分支添加CBAM时出错: {str(branch_e)}")
+                        continue
+                
+                print("CBAM模块添加完成!")
+                
+                # 确保模型在正确的设备上
+                if device != "cpu":
+                    model.model = model.model.to(f"cuda:{device}")
+                    
+            else:
+                print("警告：检测头结构不符合预期，无法添加CBAM模块")
+                
+        except ImportError as ie:
+            print(f"警告：无法导入CBAM模块: {str(ie)}")
+            print("将使用原始YOLOv8模型进行训练")
+        except Exception as cbam_e:
+            print(f"添加CBAM模块时出现错误: {str(cbam_e)}")
+            print("将使用原始YOLOv8模型进行训练")
+            # 重新加载原始模型以确保干净状态
+            model = YOLO(model_path)
             
     except Exception as e:
         print(f"加载模型时出错: {str(e)}")
@@ -362,13 +410,22 @@ def train_model():
 
     print("\n开始训练...")
     try:
+        # 更保守的batch size计算
         if device == "0":
-            suggested_batch_size = min(12, int(gpu_memory))
-            batch_size = max(1, suggested_batch_size)
+            # 为CBAM模块预留更多内存
+            available_memory = gpu_memory * 0.7  # 使用70%的GPU内存
+            suggested_batch_size = min(8, max(1, int(available_memory / 2)))  # 更保守的估算
+            batch_size = suggested_batch_size
         else:
-            batch_size = 4
+            batch_size = 2  # CPU训练使用更小的batch size
 
         print(f"使用batch_size: {batch_size}")
+
+        # 添加检查点恢复机制
+        resume_path = "runs/train/exp6/weights/last.pt"
+        resume = resume_path if os.path.exists(resume_path) else False
+        if resume:
+            print(f"检测到检查点文件，将从 {resume_path} 恢复训练")
 
         results = model.train(
             data="dataset.yaml",
@@ -379,9 +436,9 @@ def train_model():
             augment=True,
             device=device,
             project="runs/train",
-            name="exp5",
+            name="exp6",  # 使用新的实验名称避免冲突
             save=True,
-            save_period=10,
+            save_period=5,  # 更频繁地保存检查点
             cache=False,
             amp=True,
             workers=0,
@@ -396,16 +453,35 @@ def train_model():
             cos_lr=True,
             warmup_epochs=3,
             weight_decay=0.0005,
+            # 确保生成评估曲线
+            plots=True,
+            save_json=True,
+            val=True,
+            resume=resume,  # 支持断点续训
         )
 
         print("\n训练完成！")
-        print(f"最佳模型保存在: {os.path.join('runs/train/exp5/weights/best.pt')}")
+        print(f"最佳模型保存在: {os.path.join('runs/train/exp6/weights/best.pt')}")
 
         # 清理GPU内存
         clean_gpu_memory()
 
+    except KeyboardInterrupt:
+        print("\n训练被用户中断！")
+        print("可以通过设置 resume=True 从最后的检查点继续训练")
+        clean_gpu_memory()
+    except RuntimeError as re:
+        if "out of memory" in str(re).lower():
+            print(f"\nGPU内存不足错误: {str(re)}")
+            print("建议降低batch_size或使用更小的模型")
+        else:
+            print(f"运行时错误: {str(re)}")
+        clean_gpu_memory()
+        raise re
     except Exception as e:
         print(f"训练过程中出错: {str(e)}")
+        print(traceback.format_exc())
+        clean_gpu_memory()
         raise e
 
 
@@ -552,11 +628,11 @@ def test_model():
 
 def main():
     """主函数"""
-    # if not check_dataset_ready():
-    #     print("\n数据集未准备，开始处理...")
-    #     prepare_dataset()
-    # else:
-    #     print("\n检测到已存在的数据集，跳过处理步骤...")
+    if not check_dataset_ready():
+        print("\n数据集未准备，开始处理...")
+        prepare_dataset()
+    else:
+        print("\n检测到已存在的数据集，跳过处理步骤...")
 
     if not os.path.exists("dataset.yaml"):
         print("\n创建数据集配置文件...")
