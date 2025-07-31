@@ -67,15 +67,40 @@ class EdgeAttention(nn.Module):
 class CBAM(nn.Module):
     def __init__(self, in_channels, ratio=16, kernel_size=7):
         super().__init__()
+        # 确保ratio不会导致通道数为0
+        ratio = min(ratio, in_channels)
+        if in_channels // ratio < 1:
+            ratio = in_channels
+            
         self.channel_att = ChannelAttention(in_channels, ratio)
         self.spatial_att = SpatialAttention(kernel_size)
         self.edge_att = EdgeAttention(in_channels)
+        
         # 确保输出通道数与输入相同
+        self.in_channels = in_channels
         self.out_channels = in_channels
+        
+        # 添加dropout来防止过拟合
+        self.dropout = nn.Dropout2d(0.1)
 
     def forward(self, x):
+        # 验证输入张量
+        if x.size(1) != self.in_channels:
+            raise ValueError(f"Expected input with {self.in_channels} channels, got {x.size(1)}")
+            
         identity = x
+        
+        # 通道注意力
         x = x * self.channel_att(x)
+        
+        # 空间注意力  
         x = x * self.spatial_att(x)
+        
+        # 边缘注意力
         x = x * self.edge_att(x)
-        return x + identity  # 添加残差连接
+        
+        # 应用dropout
+        x = self.dropout(x)
+        
+        # 残差连接
+        return x + identity
