@@ -6,9 +6,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import traceback  
 from ultralytics import YOLO
 from tqdm import tqdm
 import gc
+
 
 
 def tile_image(image, tile_size=1024, overlap=128):
@@ -317,17 +320,50 @@ def train_model():
         else:
             print("本地未找到模型文件，将从官方下载...")
             model = YOLO("yolov8m.pt")
+
+        # 修改这部分代码
+        from models.edge_attention import CBAM
+        
+        # 获取检测头
+        detect_layer = model.model.model[-1]
+        
+        # 检查模型结构
+        print("\n当前模型结构:")
+        print(model.model)
+        
+        try:
+            # 遍历所有检测头分支并添加CBAM
+            for i in range(len(detect_layer.cv2)):
+                # 获取输入通道数
+                in_channels = detect_layer.cv2[i][0].conv.in_channels
+                # 获取输出通道数
+                out_channels = detect_layer.cv2[i][-1].out_channels
+                
+                # 构建新的序列
+                new_seq = nn.Sequential(
+                    CBAM(in_channels=in_channels),
+                    detect_layer.cv2[i][0],  # 保留原有的Conv层
+                    detect_layer.cv2[i][1],  # 保留原有的Conv层
+                    detect_layer.cv2[i][2]   # 保留原有的Conv2d层
+                )
+                detect_layer.cv2[i] = new_seq
+
+            print("\nCBAM模块添加成功!")
+            
+        except Exception as e:
+            print(f"\n修改模型结构时出错: {str(e)}")
+            print("检测头结构：", detect_layer)
+            return
+            
     except Exception as e:
         print(f"加载模型时出错: {str(e)}")
+        print(traceback.format_exc())
         return
 
     print("\n开始训练...")
     try:
         if device == "0":
-        
-            suggested_batch_size = min(
-                12, int(gpu_memory)
-            )  
+            suggested_batch_size = min(12, int(gpu_memory))
             batch_size = max(1, suggested_batch_size)
         else:
             batch_size = 4
@@ -343,12 +379,12 @@ def train_model():
             augment=True,
             device=device,
             project="runs/train",
-            name="exp4",
+            name="exp5",
             save=True,
             save_period=10,
-            cache=False,  
+            cache=False,
             amp=True,
-            workers=0, 
+            workers=0,
             exist_ok=True,
             pretrained=True,
             optimizer="auto",
@@ -363,7 +399,7 @@ def train_model():
         )
 
         print("\n训练完成！")
-        print(f"最佳模型保存在: {os.path.join('runs/train/exp4/weights/best.pt')}")
+        print(f"最佳模型保存在: {os.path.join('runs/train/exp5/weights/best.pt')}")
 
         # 清理GPU内存
         clean_gpu_memory()
@@ -436,7 +472,7 @@ def process_single_prediction(args):
 
 def test_model():
     """测试模型并可视化结果"""
-    model = YOLO("runs/train/exp4/weights/best.pt")
+    model = YOLO("runs/train/exp5/weights/best.pt")
 
     os.makedirs("runs/detect/results", exist_ok=True)
 
@@ -516,11 +552,11 @@ def test_model():
 
 def main():
     """主函数"""
-    if not check_dataset_ready():
-        print("\n数据集未准备，开始处理...")
-        prepare_dataset()
-    else:
-        print("\n检测到已存在的数据集，跳过处理步骤...")
+    # if not check_dataset_ready():
+    #     print("\n数据集未准备，开始处理...")
+    #     prepare_dataset()
+    # else:
+    #     print("\n检测到已存在的数据集，跳过处理步骤...")
 
     if not os.path.exists("dataset.yaml"):
         print("\n创建数据集配置文件...")
